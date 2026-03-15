@@ -4,6 +4,106 @@ All notable changes to the QF Framework and PoC application.
 
 ---
 
+## [v6.5.0] — 2026-03-15
+
+### `common.py` decorators applied in POC workers + perf test improvements
+
+#### `poc_app/src/workers/workers.py`
+
+Added three helper functions decorated with `common.py` call-level policies to demonstrate the combined decorator pattern:
+
+- `_enrich_single` — `@call_retry(max_attempts=3)` + `@call_circuit_breaker(fail_max=10, name="enrichment-breaker")` — simulates a retried+protected external enrichment call for single-message workers.
+- `_enrich_batch` — `@call_retry(max_attempts=2)` + `@call_circuit_breaker(fail_max=20, name="bulk-enrichment-breaker")` — same for bulk workers.
+- `_postprocess_merged` — `@call_rate_limit(per_second=10_000, key="agg-postprocess")` — rate-limited post-processing after aggregation.
+
+All active workers (`echo_single`, `echo_bulk`, `rl_single`, `rl_bulk`, `agg_basic`, `retry_single`) now delegate their enrichment to these helpers, demonstrating the Kafka-level + call-level decorator combination in a real app.
+
+#### Performance tests — default N reduced + comprehensive reports
+
+**`poc_app/tests/perf_kafka.py`**
+
+- Default `N` reduced from `100_000` to `1_000` for faster runs.
+- Always sets `fail_prob` in message payload (prevents workers from using their default failure rate during perf tests).
+- Final report additions: E2E visual bar chart, column guide, completion summary (total sent/received/missing, wall time), system info (date, Python version, CPU count).
+
+**`poc_app/tests/perf_http.py`**
+
+- Default `N` reduced from `100_000` to `1_000`.
+- Progress reporting now scales to `N/5` steps instead of fixed 10,000.
+- Final report additions: per-endpoint latency histogram (10 buckets), `min ms` column, status code breakdown on errors, combined req/s summary, system info (date, Python version, CPU count).
+
+#### Test results (N=1,000 on localhost)
+
+**HTTP — 3 endpoints, 1,000 requests each, 50 concurrent threads:**
+
+| Endpoint | req/s | mean ms | p95 ms | p99 ms | Errors |
+|---|---|---|---|---|---|
+| ner (echo_single) | ~680 | ~72 | ~880 | ~1203 | 0 |
+| translate (rl_single) | ~2,540 | ~19 | ~21 | ~21 | 0 |
+| sentiment (agg_basic) | ~2,492 | ~19 | ~22 | ~23 | 0 |
+
+All 3,000 requests: 100% success.
+
+**Kafka — 6 workers, 1,000 messages each:**
+
+| Worker | E2E (s) | Out msg/s | Status |
+|---|---|---|---|
+| echo_single | 0.53 | 1,898 | ✓ |
+| echo_bulk | 0.11 | 9,458 | ✓ |
+| retry_single | 0.10 | 9,602 | ✓ |
+| rl_single | 0.11 | 9,354 | ✓ |
+| rl_bulk | 0.10 | 9,576 | ✓ |
+| agg_basic | 0.39 | 2,533 | ✓ |
+
+All 6,000 messages received. Wall time: 2.6s.
+
+---
+
+## [v6.4.0] — 2026-03-15
+
+### Two-layer decorator architecture: Kafka-runtime policies vs function-level call policies
+
+#### New: `src/framework/decorators/common.py`
+
+Adds three function-level call policy decorators backed by battle-tested OSS libraries. These work in **any** context — inside Kafka worker functions, HTTP handlers, cron jobs, or standalone scripts. Gevent-compatible after `monkey.patch_all()`.
+
+| Decorator | Library | Description |
+|---|---|---|
+| `@call_retry` | [tenacity](https://github.com/jd/tenacity) | Retry on exception; fixed or exponential back-off; configurable exception filter |
+| `@call_circuit_breaker` | [pybreaker](https://github.com/danielfm/pybreaker) | Trip open after N consecutive failures; auto half-open; excludable exception types |
+| `@call_rate_limit` | [limits](https://limits.readthedocs.io/) | Moving-window rate limit; memory or Redis storage; per-key buckets via callable key |
+
+Custom exceptions: `RetryExhaustedError`, `CircuitOpenError`, `RateLimitExceededError` — all exported from `framework.decorators`.
+
+New dependencies added to `requirements.txt`: `tenacity>=8.2`, `pybreaker>=1.2`, `limits>=3.7`.
+
+#### Refactor: `src/framework/decorators/policies.py` → `intern.py`
+
+The existing Kafka-runtime policy decorators (`@retry_to_dlq`, `@rate_limit`, `@circuit_breaker`) moved to `src/framework/decorators/intern.py`. These remain **metadata-only** (no function wrapping) and are interpreted exclusively by the Kafka ETL runtime to pause `TopicPartition`s, re-queue messages to Kafka, and throttle thread-pool dispatch — behaviors impossible with standard call-wrapping libraries.
+
+`policies.py` is kept as a backward-compatibility shim that re-exports all symbols from `intern.py`.
+
+All internal imports updated:
+- `src/framework/decorators/kafka_workers.py` — imports configs from `.intern`
+- `src/framework/etl/framework_etl.py` — imports configs from `framework.decorators.intern`
+
+#### Updated `src/framework/decorators/__init__.py`
+
+Now exports the complete public API:
+- Kafka-runtime policies: `retry_to_dlq`, `circuit_breaker`, `rate_limit` (unchanged names)
+- Function-level call policies: `call_retry`, `call_circuit_breaker`, `call_rate_limit`
+- Custom exceptions: `RetryExhaustedError`, `CircuitOpenError`, `RateLimitExceededError`
+
+#### Tests
+
+21 new unit tests added to `tests/test_unit.py` (61 total, all pass):
+- `TestCallRetry` (6 tests): retry count, exhaustion, reraise, exception filter, no-retry on success, exponential mode
+- `TestCallCircuitBreaker` (4 tests): pass-through, open after fail_max, `__circuit_breaker__` attribute, excluded exceptions
+- `TestCallRateLimit` (6 tests): within-limit, exceeded, per-minute, invalid window, invalid on_exceeded, callable key
+- `TestCommonDecoratorImports` (5 tests): all public names importable from `framework.decorators`
+
+---
+
 ## [v6.3.0] — 2026-03-15
 
 ### Redis: non-blocking connection pool

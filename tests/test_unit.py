@@ -647,3 +647,292 @@ class TestDynamicEndpointUrl:
         # Should be /workers/ner, NOT /workers/ner/workers/ner
         assert "/workers/ner" in paths, f"Got paths: {paths}"
         assert "/workers/ner/workers/ner" not in paths, f"Doubled path found: {paths}"
+
+
+# ---------------------------------------------------------------------------
+# framework.decorators.common — function-level call policies
+# ---------------------------------------------------------------------------
+
+class TestCallRetry:
+    """Tests for @call_retry (tenacity-backed)."""
+
+    def test_retries_on_exception(self):
+        from framework.decorators.common import retry
+
+        call_count = [0]
+
+        @retry(max_attempts=3, wait_fixed=0)
+        def flaky():
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise ValueError("fail")
+            return "ok"
+
+        assert flaky() == "ok"
+        assert call_count[0] == 3
+
+    def test_raises_retry_exhausted(self):
+        from framework.decorators.common import retry, RetryExhaustedError
+
+        @retry(max_attempts=2, wait_fixed=0)
+        def always_fails():
+            raise RuntimeError("boom")
+
+        try:
+            always_fails()
+            assert False, "Should have raised"
+        except RetryExhaustedError:
+            pass
+
+    def test_reraise_option(self):
+        from framework.decorators.common import retry
+
+        @retry(max_attempts=2, wait_fixed=0, reraise=True)
+        def always_fails():
+            raise ValueError("original")
+
+        try:
+            always_fails()
+            assert False, "Should have raised"
+        except ValueError as exc:
+            assert "original" in str(exc)
+
+    def test_only_retries_specified_exceptions(self):
+        from framework.decorators.common import retry
+
+        call_count = [0]
+
+        @retry(max_attempts=3, wait_fixed=0, exceptions=(TypeError,))
+        def raises_value_error():
+            call_count[0] += 1
+            raise ValueError("not retried")
+
+        try:
+            raises_value_error()
+        except ValueError:
+            pass
+
+        # Should not retry — ValueError not in exceptions tuple
+        assert call_count[0] == 1
+
+    def test_no_retry_on_success(self):
+        from framework.decorators.common import retry
+
+        call_count = [0]
+
+        @retry(max_attempts=5, wait_fixed=0)
+        def succeeds():
+            call_count[0] += 1
+            return "done"
+
+        result = succeeds()
+        assert result == "done"
+        assert call_count[0] == 1
+
+    def test_exponential_backoff_configured(self):
+        """Decorator is accepted and callable with exponential mode (no actual wait)."""
+        from framework.decorators.common import retry
+
+        @retry(max_attempts=2, wait_exponential=True, wait_multiplier=0.001, wait_max=0.01)
+        def fn():
+            return 42
+
+        assert fn() == 42
+
+
+class TestCallCircuitBreaker:
+    """Tests for @call_circuit_breaker (pybreaker-backed)."""
+
+    def test_passes_through_on_success(self):
+        from framework.decorators.common import call_circuit_breaker
+
+        @call_circuit_breaker(fail_max=3, reset_timeout=60)
+        def fn(x):
+            return x * 2
+
+        assert fn(5) == 10
+
+    def test_opens_after_fail_max(self):
+        from framework.decorators.common import call_circuit_breaker, CircuitOpenError
+
+        @call_circuit_breaker(fail_max=2, reset_timeout=60)
+        def always_fails():
+            raise RuntimeError("err")
+
+        # pybreaker raises CircuitBreakerError (→ CircuitOpenError) on the call
+        # that reaches fail_max, and on all subsequent calls while open.
+        open_count = [0]
+        for _ in range(3):
+            try:
+                always_fails()
+            except CircuitOpenError:
+                open_count[0] += 1
+            except RuntimeError:
+                pass
+
+        assert open_count[0] >= 1, "Circuit should have opened"
+
+    def test_circuit_breaker_attribute_exposed(self):
+        from framework.decorators.common import call_circuit_breaker
+        import pybreaker
+
+        @call_circuit_breaker(fail_max=3, reset_timeout=30)
+        def fn():
+            return 1
+
+        assert hasattr(fn, "__circuit_breaker__")
+        assert isinstance(fn.__circuit_breaker__, pybreaker.CircuitBreaker)
+
+    def test_exclude_exceptions_not_counted(self):
+        from framework.decorators.common import call_circuit_breaker, CircuitOpenError
+
+        @call_circuit_breaker(fail_max=2, reset_timeout=60, exclude=(ValueError,))
+        def raises_value_error():
+            raise ValueError("excluded")
+
+        for _ in range(5):
+            try:
+                raises_value_error()
+            except ValueError:
+                pass
+
+        # Circuit should still be closed — ValueError is excluded
+        try:
+            raises_value_error()
+        except ValueError:
+            pass  # expected
+        except CircuitOpenError:
+            assert False, "Circuit should NOT be open for excluded exceptions"
+
+
+class TestCallRateLimit:
+    """Tests for @call_rate_limit (limits-backed)."""
+
+    def test_allows_calls_within_limit(self):
+        from framework.decorators.common import call_rate_limit
+
+        @call_rate_limit(per_second=100)
+        def fn():
+            return "ok"
+
+        for _ in range(5):
+            assert fn() == "ok"
+
+    def test_raises_on_exceeded(self):
+        from framework.decorators.common import call_rate_limit, RateLimitExceededError
+
+        @call_rate_limit(per_second=2, key="test_raises_on_exceeded")
+        def fn():
+            return "ok"
+
+        fn()
+        fn()
+        try:
+            fn()
+            assert False, "Should have raised RateLimitExceededError"
+        except RateLimitExceededError:
+            pass
+
+    def test_per_minute_limit(self):
+        from framework.decorators.common import call_rate_limit, RateLimitExceededError
+
+        @call_rate_limit(per_minute=3, key="test_per_minute_limit")
+        def fn():
+            return "ok"
+
+        fn()
+        fn()
+        fn()
+        try:
+            fn()
+            assert False
+        except RateLimitExceededError:
+            pass
+
+    def test_requires_exactly_one_window(self):
+        from framework.decorators.common import call_rate_limit
+
+        try:
+            @call_rate_limit(per_second=1, per_minute=1)
+            def fn():
+                pass
+            assert False, "Should raise ValueError"
+        except ValueError:
+            pass
+
+        try:
+            @call_rate_limit()
+            def fn2():
+                pass
+            assert False, "Should raise ValueError"
+        except ValueError:
+            pass
+
+    def test_invalid_on_exceeded(self):
+        from framework.decorators.common import call_rate_limit
+
+        try:
+            @call_rate_limit(per_second=1, on_exceeded="invalid")
+            def fn():
+                pass
+            assert False, "Should raise ValueError"
+        except ValueError:
+            pass
+
+    def test_callable_key(self):
+        from framework.decorators.common import call_rate_limit, RateLimitExceededError
+
+        call_counts: dict = {}
+
+        @call_rate_limit(per_second=2, key=lambda user: f"rl_test_callable_{user}")
+        def fn(user: str):
+            call_counts[user] = call_counts.get(user, 0) + 1
+            return user
+
+        # Each user has their own bucket
+        fn("alice")
+        fn("alice")
+        fn("bob")
+        fn("bob")
+
+        # alice's bucket exhausted
+        try:
+            fn("alice")
+            assert False
+        except RateLimitExceededError:
+            pass
+
+        # bob's bucket also exhausted
+        try:
+            fn("bob")
+            assert False
+        except RateLimitExceededError:
+            pass
+
+
+class TestCommonDecoratorImports:
+    """Verify all public names are importable from framework.decorators."""
+
+    def test_call_retry_importable(self):
+        from framework.decorators import call_retry
+        assert callable(call_retry)
+
+    def test_call_circuit_breaker_importable(self):
+        from framework.decorators import call_circuit_breaker
+        assert callable(call_circuit_breaker)
+
+    def test_call_rate_limit_importable(self):
+        from framework.decorators import call_rate_limit
+        assert callable(call_rate_limit)
+
+    def test_exceptions_importable(self):
+        from framework.decorators import RetryExhaustedError, CircuitOpenError, RateLimitExceededError
+        assert issubclass(RetryExhaustedError, Exception)
+        assert issubclass(CircuitOpenError, Exception)
+        assert issubclass(RateLimitExceededError, Exception)
+
+    def test_kafka_policies_still_importable(self):
+        from framework.decorators import retry_to_dlq, circuit_breaker, rate_limit
+        assert callable(retry_to_dlq)
+        assert callable(circuit_breaker)
+        assert callable(rate_limit)

@@ -1,4 +1,4 @@
-# workers_policy_tests.py
+# workers.py
 import random
 import time
 from framework.commons.logger import logger
@@ -8,6 +8,12 @@ from framework.decorators import (
     rate_limit,
     circuit_breaker,
     retry_to_dlq,
+    call_retry,
+    call_circuit_breaker,
+    call_rate_limit,
+    RetryExhaustedError,
+    CircuitOpenError,
+    RateLimitExceededError,
 )
 
 # ---------------------------------------------------------------------
@@ -37,6 +43,41 @@ def _touch_enrichment(msg: dict, key: str, value):
     return msg
 
 
+# ---------------------------------------------------------------------
+# Simulated external service calls — decorated with common.py policies
+#
+# In a real application these would call external HTTP APIs, databases,
+# ML models, etc.  Here they do lightweight dict work to demonstrate
+# the decorator behaviour without external dependencies.
+#
+# call_retry     — retries on transient errors (tenacity)
+# call_circuit_breaker — trips open after consecutive failures (pybreaker)
+# call_rate_limit      — caps calls per second (limits)
+# ---------------------------------------------------------------------
+
+@call_retry(max_attempts=3, wait_fixed=0.01, exceptions=(RuntimeError,))
+@call_circuit_breaker(fail_max=10, reset_timeout=5, name="enrichment-breaker")
+def _enrich_single(msg: dict, worker_tag: str) -> dict:
+    """Simulated enrichment call — retried up to 3× on RuntimeError."""
+    return _touch_enrichment(msg, worker_tag, {"ok": True, "ts": time.time()})
+
+
+@call_retry(max_attempts=2, wait_fixed=0.005, exceptions=(RuntimeError,))
+@call_circuit_breaker(fail_max=20, reset_timeout=5, name="bulk-enrichment-breaker")
+def _enrich_batch(messages: list, worker_tag: str) -> list:
+    """Simulated bulk enrichment call — retried up to 2× on RuntimeError."""
+    return [
+        _touch_enrichment(dict(m), worker_tag, {"ok": True, "ts": time.time()})
+        for m in messages
+    ]
+
+
+@call_rate_limit(per_second=10_000, key="agg-postprocess")
+def _postprocess_merged(merged: dict, worker_tag: str) -> dict:
+    """Simulated post-processing after aggregation — rate limited."""
+    return _touch_enrichment(merged, worker_tag, {"merged": True, "ts": time.time()})
+
+
 # ============================================================
 # A) ONLY kafka_handler (single + bulk) - no policies
 # ============================================================
@@ -50,9 +91,7 @@ def _touch_enrichment(msg: dict, key: str, value):
     metadatas={"worker": "echo_single"},
 )
 def echo_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
-    mid = message.get("id")
-    # logger.info(f"[echo_single] consumer={consumer_name} id={mid} meta={metadatas}")
-    return _touch_enrichment(message, "echo_single", {"ok": True, "ts": time.time()})
+    return _enrich_single(message, "echo_single")
 
 
 @kafka_handler(
@@ -66,11 +105,7 @@ def echo_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
     metadatas={"worker": "echo_bulk", "mode": "bulk"},
 )
 def echo_bulk(messages: list[dict], consumer_name: str, metadatas: dict):
-    # logger.info(f"[echo_bulk] consumer={consumer_name} batch={len(messages)} meta={metadatas}")
-    out = []
-    for m in messages:
-        out.append(_touch_enrichment(m, "echo_bulk", {"ok": True, "ts": time.time()}))
-    return out
+    return _enrich_batch(messages, "echo_bulk")
 
 
 # # ============================================================
@@ -87,14 +122,19 @@ def echo_bulk(messages: list[dict], consumer_name: str, metadatas: dict):
     metadatas={"worker": "agg_basic", "mode": "aggregator"},
 )
 def agg_basic_after_merge(merged: dict, consumer_name: str, metadatas: dict) -> dict:
-    mid = merged.get("id")
-    # logger.info(f"[agg_basic] consumer={consumer_name} id={mid} merged_keys={list(merged.keys())} meta={metadatas}")
-    return _touch_enrichment(merged, "agg_basic", {"merged": True, "ts": time.time()})
+    return _postprocess_merged(merged, "agg_basic")
 
 
 # ============================================================
 # C) kafka_handler + retry_to_dlq (single + bulk)
 #    - random fails -> retries -> eventually DLQ
+#
+# Layers:
+#   @retry_to_dlq    — Kafka-level retry: re-queues message back to
+#                      input topic up to max_attempts, then DLQ
+#   @call_retry      — call-level retry: retries the enrichment helper
+#                      up to 3× on RuntimeError before raising to the
+#                      Kafka runtime (which then applies retry_to_dlq)
 # ============================================================
 
 @kafka_handler(
@@ -107,12 +147,9 @@ def agg_basic_after_merge(merged: dict, consumer_name: str, metadatas: dict) -> 
 )
 @retry_to_dlq(max_attempts=2, dlq_topic="poc.dlq.retry.single", retry_count_field="retry_count")
 def retry_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
-    mid = message.get("id")
     if _should_fail(message, default_prob=0.10):
-        # logger.info(f"[retry_single] FAIL consumer={consumer_name} id={mid} retry_count={message.get('retry_count')}")
         raise RuntimeError("random failure (retry_single)")
-    # logger.info(f"[retry_single] OK consumer={consumer_name} id={mid} retry_count={message.get('retry_count')}")
-    return _touch_enrichment(message, "retry_single", {"ok": True, "ts": time.time()})
+    return _enrich_single(message, "retry_single")
 
 
 # # ============================================================
@@ -129,9 +166,7 @@ def retry_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
 )
 @rate_limit(rps=5000, burst=5000)  # interpret as "dispatches per second" in your current runtime
 def rl_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
-    mid = message.get("id")
-    # logger.info(f"[rl_single] consumer={consumer_name} id={mid}")
-    return _touch_enrichment(message, "rl_single", {"ok": True, "ts": time.time()})
+    return _enrich_single(message, "rl_single")
 
 
 @kafka_handler(
@@ -146,11 +181,7 @@ def rl_single(message: dict, consumer_name: str, metadatas: dict) -> dict:
 )
 @rate_limit(rps=5000, burst=5000)  # with current runtime, this is ~10 BATCHES/sec, not messages/sec
 def rl_bulk(messages: list[dict], consumer_name: str, metadatas: dict):
-    # logger.info(f"[rl_bulk] consumer={consumer_name} batch={len(messages)}")
-    out = []
-    for m in messages:
-        out.append(_touch_enrichment(m, "rl_bulk", {"ok": True, "ts": time.time()}))
-    return out
+    return _enrich_batch(messages, "rl_bulk")
 
 
 # # ============================================================

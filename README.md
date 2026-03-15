@@ -37,9 +37,12 @@ flowchart TB
 |---|---|
 | `@kafka_handler` | Registers a function as a Kafka worker (single or bulk mode) |
 | `@kafka_aggregator` | Registers a function that merges messages from multiple topics using Redis |
-| `@retry_to_dlq` | Policy: retry N times, then route to DLQ topic |
-| `@rate_limit` | Policy: token-bucket throttle on job dispatch rate |
-| `@circuit_breaker` | Policy: trip open on consecutive failures, auto-reset |
+| `@retry_to_dlq` | Kafka policy: retry N times inside Kafka, then route to DLQ topic |
+| `@rate_limit` | Kafka policy: token-bucket throttle on job dispatch rate |
+| `@circuit_breaker` | Kafka policy: trip open on consecutive failures, pause partitions, auto-reset |
+| `@call_retry` | Call policy: retry on exception (tenacity); usable anywhere |
+| `@call_circuit_breaker` | Call policy: trip open on consecutive failures (pybreaker); usable anywhere |
+| `@call_rate_limit` | Call policy: moving-window rate limit (limits); usable anywhere |
 | `CommitCoordinator` | Tracks out-of-order job completions; advances offset window correctly |
 | Backpressure | Per-TP pause/resume when worker pool is saturated |
 | Bulk mode | Buffer N messages per partition, flush on size OR timeout |
@@ -189,9 +192,13 @@ handles.app.run(host="0.0.0.0", port=5000)
 
 ## Policy Decorators
 
-Policies are **metadata-only** — they attach configuration to the function via `__policy_*__` attributes. The ETL runtime reads them and enforces behavior. This means the same decorated function can be called directly (from tests or HTTP handlers) without triggering retry/rate-limit logic.
+### Kafka-runtime policies
+
+Metadata-only decorators — they attach configuration attributes to the function. The ETL runtime reads them and enforces behavior at the transport level (pausing partitions, re-queuing messages, throttling dispatch). Calling the function directly has no policy side-effects.
 
 ```python
+from framework.decorators import kafka_handler, retry_to_dlq, rate_limit, circuit_breaker
+
 # Correct order: policy decorators ABOVE @kafka_handler
 @retry_to_dlq(max_attempts=5, dlq_topic="my.dlq")
 @rate_limit(rps=100, burst=200)
@@ -199,6 +206,25 @@ Policies are **metadata-only** — they attach configuration to the function via
 def my_worker(message, consumer_name, metadatas):
     ...
 ```
+
+### Function-level call policies
+
+Backed by [tenacity](https://github.com/jd/tenacity), [pybreaker](https://github.com/danielfm/pybreaker), and [limits](https://limits.readthedocs.io/). These wrap the actual function call and work in any context (inside workers, HTTP handlers, cron jobs, standalone scripts). Gevent-safe after `monkey.patch_all()`.
+
+```python
+from framework.decorators import call_retry, call_circuit_breaker, call_rate_limit
+
+@call_retry(max_attempts=3, wait_exponential=True, wait_max=5.0)
+@call_circuit_breaker(fail_max=5, reset_timeout=60)
+def call_external_service(payload):
+    return requests.post("http://svc/api", json=payload, timeout=2).json()
+
+@call_rate_limit(per_second=100, key="my-bucket")
+def send_notification(user_id, message):
+    ...
+```
+
+Custom exceptions: `RetryExhaustedError`, `CircuitOpenError`, `RateLimitExceededError` — all importable from `framework.decorators`.
 
 ---
 
@@ -224,7 +250,8 @@ python poc_app/tests/perf_kafka.py
 | File | Description |
 |---|---|
 | `src/framework/decorators/kafka_workers.py` | Worker registry + `@kafka_handler`, `@kafka_aggregator` |
-| `src/framework/decorators/policies.py` | `@retry_to_dlq`, `@rate_limit`, `@circuit_breaker` |
+| `src/framework/decorators/intern.py` | Kafka-runtime policies: `@retry_to_dlq`, `@rate_limit`, `@circuit_breaker` |
+| `src/framework/decorators/common.py` | Function-level call policies: `@call_retry`, `@call_circuit_breaker`, `@call_rate_limit` |
 | `src/framework/etl/framework_etl.py` | Kafka runtime: poll loop, CommitCoordinator, dispatch |
 | `src/framework/api/dynamic.py` | Flask-RESTX dynamic endpoint generation |
 | `src/framework/redis/redis_utils.py` | Redis aggregation with Lua scripts |

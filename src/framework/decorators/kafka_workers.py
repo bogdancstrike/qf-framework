@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Literal
 
-from .policies import RetryToDlqConfig, CircuitBreakerConfig, RateLimitConfig
+from .intern import RetryToDlqConfig, CircuitBreakerConfig, RateLimitConfig
 
 
 WorkerKind = Literal["handler", "aggregator"]

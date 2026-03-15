@@ -32,7 +32,7 @@ from framework.decorators.kafka_workers import (
     ensure_message_id,
     worker_for_topic,
 )
-from framework.decorators.policies import CircuitBreakerConfig, RateLimitConfig, RetryToDlqConfig
+from framework.decorators.intern import CircuitBreakerConfig, RateLimitConfig, RetryToDlqConfig
 from framework.redis.redis_utils import RedisUtils
 from models.models import init_db
 

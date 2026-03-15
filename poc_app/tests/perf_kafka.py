@@ -3,17 +3,21 @@
 Kafka workers performance test.
 
 For each worker: produces N messages to input topic(s), consumes from
-output topic until all expected messages arrive, and reports throughput.
+output topic until all expected messages arrive, and reports throughput
+and latency.
 
 Usage:
-  python tests/perf_kafka.py [N]   # N messages per worker (default 100_000)
+  python tests/perf_kafka.py [N]   # N messages per worker (default 1_000)
 """
 import json
+import os
+import platform
 import sys
 import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
@@ -22,52 +26,52 @@ from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 # Config
 # ---------------------------------------------------------------------------
 BOOTSTRAP = "localhost:9094"
-N = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
-FLUSH_EVERY = 5_000
-CONSUME_TIMEOUT_SEC = 300   # max wait after produce finishes
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 1_000
+FLUSH_EVERY = max(N // 10, 100)
+CONSUME_TIMEOUT_SEC = 120   # max wait after produce finishes
 
 WORKERS = [
     {
-        "name":   "echo_single",
-        "in":     ["poc.echo.single.in"],
-        "out":    "poc.echo.single.out",
-        "kind":   "single",
+        "name":      "echo_single",
+        "in":        ["poc.echo.single.in"],
+        "out":       "poc.echo.single.out",
+        "kind":      "single",
         "fail_prob": 0,
     },
     {
-        "name":   "echo_bulk",
-        "in":     ["poc.echo.bulk.in"],
-        "out":    "poc.echo.bulk.out",
-        "kind":   "bulk",
+        "name":      "echo_bulk",
+        "in":        ["poc.echo.bulk.in"],
+        "out":       "poc.echo.bulk.out",
+        "kind":      "bulk",
         "fail_prob": 0,
     },
     {
-        "name":   "retry_single",
-        "in":     ["poc.retry.single.in"],
-        "out":    "poc.retry.single.out",
-        "dlq":    "poc.dlq.retry.single",
-        "kind":   "single",
+        "name":      "retry_single",
+        "in":        ["poc.retry.single.in"],
+        "out":       "poc.retry.single.out",
+        "dlq":       "poc.dlq.retry.single",
+        "kind":      "single",
         "fail_prob": 0,   # force success so all land in .out
     },
     {
-        "name":   "rl_single",
-        "in":     ["poc.rl.single.in"],
-        "out":    "poc.rl.single.out",
-        "kind":   "single",
+        "name":      "rl_single",
+        "in":        ["poc.rl.single.in"],
+        "out":       "poc.rl.single.out",
+        "kind":      "single",
         "fail_prob": 0,
     },
     {
-        "name":   "rl_bulk",
-        "in":     ["poc.rl.bulk.in"],
-        "out":    "poc.rl.bulk.out",
-        "kind":   "bulk",
+        "name":      "rl_bulk",
+        "in":        ["poc.rl.bulk.in"],
+        "out":       "poc.rl.bulk.out",
+        "kind":      "bulk",
         "fail_prob": 0,
     },
     {
-        "name":   "agg_basic",
-        "in":     ["poc.agg.basic.a", "poc.agg.basic.b"],   # pairs with same id
-        "out":    "poc.agg.basic.out",
-        "kind":   "aggregator",
+        "name":      "agg_basic",
+        "in":        ["poc.agg.basic.a", "poc.agg.basic.b"],   # pairs with same id
+        "out":       "poc.agg.basic.out",
+        "kind":      "aggregator",
         "fail_prob": 0,
     },
 ]
@@ -98,10 +102,14 @@ def _end_offset(topic: str) -> int:
     return off
 
 
-def _consume_n(topic: str, start_offset: int, expected: int, timeout_sec: float) -> tuple[int, float]:
+def _consume_n(
+    topic: str, start_offset: int, expected: int, timeout_sec: float
+) -> tuple[int, float, float]:
     """
     Consume from `topic` starting at `start_offset` until `expected` messages
-    or timeout. Returns (count_received, elapsed_sec_from_first_msg).
+    or timeout.
+
+    Returns (count_received, first_msg_latency_sec, consume_window_sec).
     """
     consumer = KafkaConsumer(
         bootstrap_servers=BOOTSTRAP,
@@ -122,14 +130,16 @@ def _consume_n(topic: str, start_offset: int, expected: int, timeout_sec: float)
         batch = consumer.poll(timeout_ms=500, max_records=5000)
         for _, records in batch.items():
             for _ in records:
+                now = time.time()
                 if first_ts is None:
-                    first_ts = time.time()
+                    first_ts = now
                 count += 1
-                last_ts = time.time()
+                last_ts = now
 
     consumer.close()
-    elapsed = (last_ts - first_ts) if (first_ts and last_ts and last_ts > first_ts) else 0.001
-    return count, elapsed
+    window = (last_ts - first_ts) if (first_ts and last_ts and last_ts > first_ts) else 0.001
+    first_lag = (first_ts - time.time()) if first_ts else 0.0   # not meaningful here; use e2e
+    return count, window, first_ts or time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +149,13 @@ def _consume_n(topic: str, start_offset: int, expected: int, timeout_sec: float)
 @dataclass
 class WorkerResult:
     name: str
+    kind: str
     n_sent: int = 0
     n_received: int = 0
+    n_expected: int = 0
     produce_sec: float = 0.0
-    e2e_sec: float = 0.0        # from first produce to last output
-    consume_sec: float = 0.0    # from first output to last output
+    e2e_sec: float = 0.0        # produce_start → last output
+    consume_window_sec: float = 0.0   # first output → last output
     status: str = "OK"
     notes: str = ""
 
@@ -156,25 +168,26 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
     fail_prob = w.get("fail_prob", 0)
     expected_out = N   # 1 output per input (aggregator: 1 per pair)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*64}")
     print(f"  Worker: {name}  ({kind})  N={N:,}")
-    print(f"{'='*60}")
+    print(f"{'='*64}")
 
-    # 1. Snapshot end offset of output topic (create it first if needed)
+    # 1. Snapshot end offset of output topic
     try:
         out_start = _end_offset(out_topic)
     except Exception:
         out_start = 0
-    print(f"  Output topic offset before test: {out_start}")
+    print(f"  Output topic offset before test : {out_start}")
 
     # 2. Start consumer thread BEFORE producing
-    consume_results = {}
+    consume_results: dict = {}
     consume_event = threading.Event()
 
     def _consumer_thread():
-        cnt, elapsed = _consume_n(out_topic, out_start, expected_out, CONSUME_TIMEOUT_SEC)
+        cnt, window, first_ts = _consume_n(out_topic, out_start, expected_out, CONSUME_TIMEOUT_SEC)
         consume_results["count"] = cnt
-        consume_results["elapsed"] = elapsed
+        consume_results["window"] = window
+        consume_results["first_ts"] = first_ts
         consume_event.set()
 
     ct = threading.Thread(target=_consumer_thread, daemon=True)
@@ -185,7 +198,6 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
     n_sent = 0
 
     if kind == "aggregator":
-        # Both parts must arrive; same id ensures aggregation
         for i in range(N):
             mid = f"{name}-{i}"
             producer.send(in_topics[0], {"id": mid, "a": f"A{i}"})
@@ -197,9 +209,9 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
     else:
         topic = in_topics[0]
         for i in range(N):
-            msg: dict = {"id": f"{name}-{i}", "v": i}
-            if fail_prob:
-                msg["fail_prob"] = fail_prob
+            # Always include fail_prob so workers don't fall back to their default failure rate.
+            # fail_prob=0 means "force success" in this perf test.
+            msg: dict = {"id": f"{name}-{i}", "v": i, "fail_prob": fail_prob}
             producer.send(topic, msg)
             n_sent += 1
             if i % FLUSH_EVERY == 0 and i > 0:
@@ -209,7 +221,7 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
     producer.flush()
     produce_end = time.time()
     produce_sec = produce_end - produce_start
-    produce_rps = N / produce_sec
+    produce_rps = N / max(produce_sec, 0.001)
 
     print(f"  Produced {n_sent:,} msgs in {produce_sec:.2f}s  ({produce_rps:,.0f} msg/s)")
     print(f"  Waiting for {expected_out:,} outputs (timeout {CONSUME_TIMEOUT_SEC}s)...")
@@ -218,31 +230,44 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
     consume_event.wait(timeout=CONSUME_TIMEOUT_SEC + 5)
     e2e_sec = time.time() - produce_start
     n_received = consume_results.get("count", 0)
-    consume_sec = consume_results.get("elapsed", 0.0)
+    consume_window = consume_results.get("window", 0.0)
 
     status = "OK" if n_received >= expected_out else "PARTIAL"
     notes = ""
     if n_received < expected_out:
-        notes = f"missing {expected_out - n_received:,} messages"
-    if n_received > expected_out:
-        notes = f"extra {n_received - expected_out:,} (pre-existing?)"
+        notes = f"missing {expected_out - n_received:,}"
+    elif n_received > expected_out:
+        notes = f"+{n_received - expected_out:,} extra (pre-existing?)"
 
     out_rps = n_received / max(e2e_sec, 0.001)
+    consume_rps = n_received / max(consume_window, 0.001)
     print(f"  Received {n_received:,}/{expected_out:,} outputs")
-    print(f"  E2E time: {e2e_sec:.2f}s  |  E2E throughput: {out_rps:,.0f} msg/s")
+    print(f"  E2E: {e2e_sec:.2f}s  |  E2E throughput: {out_rps:,.0f} msg/s")
+    print(f"  Consume window: {consume_window:.2f}s  |  Output rate: {consume_rps:,.0f} msg/s")
     if notes:
         print(f"  NOTE: {notes}")
 
     return WorkerResult(
         name=name,
+        kind=kind,
         n_sent=n_sent,
         n_received=n_received,
+        n_expected=expected_out,
         produce_sec=produce_sec,
         e2e_sec=e2e_sec,
-        consume_sec=consume_sec,
+        consume_window_sec=consume_window,
         status=status,
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for report
+# ---------------------------------------------------------------------------
+
+def _bar(value: float, max_value: float, width: int = 16) -> str:
+    filled = int(round(value / max_value * width)) if max_value > 0 else 0
+    return "[" + "#" * filled + "." * (width - filled) + "]"
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +275,22 @@ def test_worker(w: dict, producer: KafkaProducer) -> WorkerResult:
 # ---------------------------------------------------------------------------
 
 def main():
-    print(f"\n{'#'*60}")
-    print(f"  QF Kafka Workers Performance Test")
-    print(f"  Messages per worker: {N:,}")
-    print(f"  Bootstrap: {BOOTSTRAP}")
-    print(f"{'#'*60}\n")
+    run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        cpu_count = os.cpu_count() or "?"
+    except Exception:
+        cpu_count = "?"
+
+    print(f"\n{'#'*64}")
+    print(f"  QF Framework — Kafka Workers Performance Test")
+    print(f"{'#'*64}")
+    print(f"  Date           : {run_ts}")
+    print(f"  Python         : {platform.python_version()}")
+    print(f"  CPUs           : {cpu_count}")
+    print(f"  Bootstrap      : {BOOTSTRAP}")
+    print(f"  Msgs / worker  : {N:,}")
+    print(f"  Workers        : {len(WORKERS)}")
+    print(f"{'#'*64}\n")
 
     producer = _make_producer()
     results: list[WorkerResult] = []
@@ -267,42 +303,74 @@ def main():
     producer.close()
     overall_sec = time.time() - overall_start
 
-    # ---------------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Final Report
-    # ---------------------------------------------------------------------------
-    print(f"\n\n{'#'*60}")
-    print(f"  FINAL REPORT")
-    print(f"{'#'*60}")
-    print(f"  Total wall time: {overall_sec:.1f}s")
-    print(f"  Messages per worker: {N:,}\n")
+    # -----------------------------------------------------------------------
+    print(f"\n\n{'#'*64}")
+    print(f"  FINAL REPORT — QF Kafka Workers Performance Test")
+    print(f"{'#'*64}")
+    print(f"  Date             : {run_ts}")
+    print(f"  Bootstrap        : {BOOTSTRAP}")
+    print(f"  Total wall time  : {overall_sec:.1f}s")
+    print(f"  Messages/worker  : {N:,}")
+    print(f"  Workers tested   : {len(results)}\n")
 
-    col_w = [14, 8, 10, 10, 10, 10, 8, 20]
-    header = (
-        f"{'Worker':<{col_w[0]}} {'Status':<{col_w[1]}} "
-        f"{'Sent':>{col_w[2]}} {'Received':>{col_w[3]}} "
-        f"{'Produce/s':>{col_w[4]}} {'E2E/s':>{col_w[5]}} "
-        f"{'E2E_rps':>{col_w[6]}} {'Notes':<{col_w[7]}}"
+    # ---- main table ----
+    col = [14, 11, 8, 9, 10, 10, 10, 10, 16]
+    hdr = (
+        f"{'Worker':<{col[0]}} {'Kind':<{col[1]}} {'Status':<{col[2]}} "
+        f"{'Sent':>{col[3]}} {'Received':>{col[4]}} "
+        f"{'Prod msg/s':>{col[5]}} {'E2E s':>{col[6]}} {'Out msg/s':>{col[7]}} "
+        f"{'Notes':<{col[8]}}"
     )
-    sep = "-" * sum(col_w)
-    print(header)
+    sep = "-" * sum(col)
+    print(hdr)
     print(sep)
 
     all_ok = True
+    max_e2e = max((r.e2e_sec for r in results), default=1.0)
     for r in results:
-        e2e_rps = r.n_received / max(r.e2e_sec, 0.001)
         prod_rps = r.n_sent / max(r.produce_sec, 0.001)
+        out_rps = r.n_received / max(r.e2e_sec, 0.001)
         if r.status != "OK":
             all_ok = False
+        flag = "" if r.status == "OK" else "✗"
         print(
-            f"{r.name:<{col_w[0]}} {r.status:<{col_w[1]}} "
-            f"{r.n_sent:>{col_w[2]},} {r.n_received:>{col_w[3]},} "
-            f"{prod_rps:>{col_w[4]},.0f} {r.e2e_sec:>{col_w[5]}.1f} "
-            f"{e2e_rps:>{col_w[6]},.0f} {r.notes:<{col_w[7]}}"
+            f"{r.name:<{col[0]}} {r.kind:<{col[1]}} {(r.status + flag):<{col[2]}} "
+            f"{r.n_sent:>{col[3]},} {r.n_received:>{col[4]},} "
+            f"{prod_rps:>{col[5]},.0f} {r.e2e_sec:>{col[6]}.2f} {out_rps:>{col[7]},.0f} "
+            f"{r.notes:<{col[8]}}"
         )
-
     print(sep)
-    print(f"\n  Overall: {'ALL PASSED' if all_ok else 'SOME FAILURES'}")
-    print(f"\nColumns: Produce/s = input produce rate, E2E/s = seconds, E2E_rps = end-to-end output rate\n")
+
+    # ---- E2E time visual comparison ----
+    print(f"\n  E2E time comparison (lower = faster):\n")
+    for r in results:
+        bar = _bar(r.e2e_sec, max_e2e, 28)
+        status_flag = "✓" if r.status == "OK" else "✗"
+        out_rps = r.n_received / max(r.e2e_sec, 0.001)
+        print(f"  {r.name:<14} {bar} {r.e2e_sec:5.2f}s  {out_rps:>8,.0f} msg/s  {status_flag}")
+
+    # ---- completion summary ----
+    total_sent = sum(r.n_sent for r in results)
+    total_recv = sum(r.n_received for r in results)
+    total_expected = sum(r.n_expected for r in results)
+    n_ok = sum(1 for r in results if r.status == "OK")
+    n_fail = len(results) - n_ok
+
+    print(f"\n  Completion summary:")
+    print(f"    Workers tested  : {len(results)}")
+    print(f"    Passed          : {n_ok}  |  Failed : {n_fail}")
+    print(f"    Total sent      : {total_sent:,}")
+    print(f"    Total received  : {total_recv:,}  /  {total_expected:,} expected")
+    lag = total_expected - total_recv
+    if lag > 0:
+        print(f"    Total missing   : {lag:,}")
+    print(f"    Wall time       : {overall_sec:.1f}s")
+    print(f"\n  Column guide:")
+    print(f"    Prod msg/s = input produce rate  |  E2E s = produce_start → last output")
+    print(f"    Out msg/s  = output receive rate (E2E throughput)")
+    print(f"\n  Overall: {'ALL PASSED ✓' if all_ok else 'SOME FAILURES ✗'}\n")
 
 
 if __name__ == "__main__":

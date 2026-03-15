@@ -217,36 +217,48 @@ python -m pytest tests/test_integration.py -v --timeout=120
 **HTTP performance benchmark**
 
 ```bash
-python poc_app/tests/perf_http.py
+# python tests/perf_http.py [N] [concurrency]  (default: N=1_000, concurrency=50)
+python tests/perf_http.py 1000 50
 ```
 
 **Kafka performance benchmark**
 
 ```bash
-python poc_app/tests/perf_kafka.py
+# python tests/perf_kafka.py [N]  (default: N=1_000)
+python tests/perf_kafka.py 1000
 ```
 
 ---
 
 ## Performance Results
 
-Results measured on a local development machine with all services running via Docker.
+Results measured on localhost with all services in Docker. Workers use `call_retry` + `call_circuit_breaker` inside their enrichment helpers (v6.5+).
 
-### HTTP throughput
+### HTTP — 1,000 requests per endpoint, 50 concurrent threads
 
-| Metric | Value |
-|---|---|
-| Throughput | ~2,700 req/s |
-| Mean latency | 18 ms |
-| p99 latency | < 50 ms |
-| Error rate | 0% |
+| Endpoint | req/s | mean ms | p95 ms | p99 ms | Errors |
+|---|---|---|---|---|---|
+| ner (echo_single) | ~680 | ~72 | ~880 | ~1,203 | 0% |
+| translate (rl_single) | ~2,540 | ~19 | ~21 | ~21 | 0% |
+| sentiment (agg_basic) | ~2,492 | ~19 | ~22 | ~23 | 0% |
 
-### Kafka single workers
+3,000 total requests, 100% success.
 
-100,000 messages fully drained to LAG=0 across single-mode workers after correctness fixes were applied.
+### Kafka — 1,000 messages per worker
+
+| Worker | E2E (s) | Output msg/s | Status |
+|---|---|---|---|
+| echo_single | 0.53 | 1,898 | ✓ |
+| echo_bulk | 0.11 | 9,458 | ✓ |
+| retry_single | 0.10 | 9,602 | ✓ |
+| rl_single | 0.11 | 9,354 | ✓ |
+| rl_bulk | 0.10 | 9,576 | ✓ |
+| agg_basic | 0.39 | 2,533 | ✓ |
+
+6,000 messages, all received. Total wall time: 2.6s.
 
 ### Known caveat: echo_bulk producer contention
 
-When `KAFKA_BULK_OUTPUT_SYNC=True` and `max_workers=100`, the bulk producer can experience lock contention, reducing throughput significantly.
+When `KAFKA_BULK_OUTPUT_SYNC=True` and `max_workers=100`, the bulk producer can experience lock contention under high load.
 
 **Workaround:** set `KAFKA_BULK_OUTPUT_SYNC=False` in `.env` to use asynchronous produce calls for bulk workers.

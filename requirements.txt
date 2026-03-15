@@ -20,6 +20,9 @@ urllib3==2.3.0
 varname==0.14.0
 watchdog==6.0.0
 redis==5.2.1
+tenacity>=8.2
+pybreaker>=1.2
+limits>=3.7
 opentelemetry-api==1.30.0
 opentelemetry-distro==0.51b0
 opentelemetry-exporter-jaeger-thrift==1.21.0

@@ -12,7 +12,7 @@
 2. [Architecture](#2-architecture)
 3. [Worker Registry](#3-worker-registry)
 4. [ETL Runtime](#4-etl-runtime)
-5. [Policy Decorators](#5-policy-decorators)
+5. [Policy Decorators](#5-policy-decorators) — Kafka-runtime (`intern.py`) and function-level call policies (`common.py`)
 6. [Aggregator](#6-aggregator)
 7. [Dynamic API](#7-dynamic-api)
 8. [Configuration Reference](#8-configuration-reference)
@@ -333,11 +333,108 @@ When the breaker opens, all TPs handled by that worker are paused. New records c
 
 ## 5. Policy Decorators
 
-**Module:** `src/framework/decorators/policies.py`
+The framework ships two independent decorator layers with different scopes:
 
-### Design: metadata-only decoration
+| Layer | Module | Backed by | Works in |
+|---|---|---|---|
+| Kafka-runtime policies | `decorators/intern.py` | Custom (metadata-only) | Kafka ETL runtime only |
+| Function-level call policies | `decorators/common.py` | tenacity / pybreaker / limits | Anywhere (Kafka, HTTP, cron, scripts) |
 
-Policy decorators do **not** wrap the function call. They attach typed configuration objects as attributes on the function object:
+---
+
+### When to use `intern.py` vs `common.py`
+
+**Use `intern.py` decorators (`@retry_to_dlq`, `@rate_limit`, `@circuit_breaker`) when:**
+
+- The policy should be enforced at the **Kafka transport level** — re-queuing messages back to the input topic, pausing `TopicPartition`s, or throttling the dispatch rate into a thread pool.
+- You want retries to survive process restarts (the retry counter is embedded in the Kafka message payload and re-read on each delivery).
+- You need to protect an **entire worker** from overloading — not just one outbound call inside it.
+- The worker is only ever called from the Kafka ETL runtime (not directly from tests or HTTP handlers).
+
+```python
+from framework.decorators import kafka_handler, retry_to_dlq, rate_limit, circuit_breaker
+
+# ✅ Kafka-level retry: message is put back into poc.input after a failure
+# and escalated to poc.dlq after 3 total attempts.
+@kafka_handler(name="enrich", topics_in=["poc.input"], topics_out=["poc.output"])
+@retry_to_dlq(max_attempts=3, dlq_topic="poc.dlq")
+def enrich_worker(message: dict, consumer_name: str, metadatas: dict) -> dict:
+    return process(message)
+
+# ✅ Rate-limit dispatch into this worker's thread pool (Kafka-level throttle)
+@kafka_handler(name="throttled", topics_in=["poc.events"], topics_out=["poc.enriched"])
+@rate_limit(rps=500, burst=1000)
+def throttled_worker(message: dict, consumer_name: str, metadatas: dict) -> dict:
+    return enrich(message)
+```
+
+**Use `common.py` decorators (`@call_retry`, `@call_circuit_breaker`, `@call_rate_limit`) when:**
+
+- You are calling an **external service** (HTTP API, database, ML model, third-party SDK) from inside a worker or handler.
+- You want the same resilience policy to work outside the Kafka context — in HTTP handlers, cron jobs, standalone scripts, or tests.
+- You need **immediate retries** with back-off on transient network errors (rather than re-queuing to Kafka).
+- You want to **protect a specific outbound call** from cascading failures, not the entire worker.
+- Your app may use **gevent** — all three backing libraries are monkey-patchable.
+
+```python
+from framework.decorators import call_retry, call_circuit_breaker, call_rate_limit
+
+# ✅ Retry transient HTTP errors immediately (no Kafka round-trip)
+@call_retry(max_attempts=3, wait_exponential=True, wait_max=5.0, exceptions=(IOError, TimeoutError))
+@call_circuit_breaker(fail_max=5, reset_timeout=60, name="enrichment-api")
+def call_enrichment_api(payload: dict) -> dict:
+    return requests.post("http://enrich-svc/enrich", json=payload, timeout=2).json()
+
+# ✅ Cap calls to a downstream service at 100/s regardless of how many Kafka workers run
+@call_rate_limit(per_second=100, key="downstream-api", on_exceeded="sleep")
+def call_downstream(payload: dict) -> dict:
+    return requests.post("http://downstream/api", json=payload).json()
+```
+
+**Combining both layers** is the recommended pattern for production workers:
+
+```python
+from framework.decorators import (
+    kafka_handler, retry_to_dlq,
+    call_retry, call_circuit_breaker,
+)
+
+@kafka_handler(name="enrich", topics_in=["poc.input"], topics_out=["poc.output"])
+@retry_to_dlq(max_attempts=3, dlq_topic="poc.dlq")   # ← Kafka-level: re-queue or DLQ
+def enrich_worker(message: dict, consumer_name: str, metadatas: dict) -> dict:
+    # ← call-level: fast retry + circuit breaker on the external HTTP call
+    result = _call_enrichment_service(message)
+    return {**message, "enrichment": result}
+
+@call_retry(max_attempts=3, wait_exponential=True, wait_max=5.0)
+@call_circuit_breaker(fail_max=5, reset_timeout=60, name="enrichment-breaker")
+def _call_enrichment_service(message: dict) -> dict:
+    return requests.post("http://enrich-svc/enrich", json=message, timeout=2).json()
+```
+
+**Decision table:**
+
+| Scenario | Use |
+|---|---|
+| Re-queue failed Kafka message to retry on next poll | `@retry_to_dlq` (intern) |
+| Route permanently failed messages to a DLQ topic | `@retry_to_dlq` (intern) |
+| Throttle how fast Kafka dispatches to a worker | `@rate_limit` (intern) |
+| Trip open entire worker partition on repeated failures | `@circuit_breaker` (intern) |
+| Retry a flaky HTTP / DB call with back-off | `@call_retry` (common) |
+| Prevent cascading failures from one slow dependency | `@call_circuit_breaker` (common) |
+| Cap calls to an external API across all workers | `@call_rate_limit` (common) |
+| Use resilience policies in non-Kafka code | Any `common.py` decorator |
+| Use with gevent | Any `common.py` decorator (after `monkey.patch_all()`) |
+
+---
+
+---
+
+### 5a. Kafka-runtime policies (`intern.py`)
+
+**Module:** `src/framework/decorators/intern.py`
+
+These decorators do **not** wrap the function call. They attach typed configuration objects as attributes on the function:
 
 | Attribute | Type | Set by |
 |---|---|---|
@@ -345,13 +442,11 @@ Policy decorators do **not** wrap the function call. They attach typed configura
 | `_qsint_circuit_breaker` | `CircuitBreakerConfig` | `@circuit_breaker` |
 | `_qsint_rate_limit` | `RateLimitConfig` | `@rate_limit` |
 
-The ETL runtime reads these attributes from `WorkerSpec` (which mirrors them from the function at registration time) and applies the policy logic itself. This means:
+The ETL runtime reads these attributes from `WorkerSpec` and applies the policy logic at the transport level (pausing `TopicPartition`s, re-queuing to Kafka, throttling dispatch). Calling the decorated function directly has no policy side-effects.
 
-- The same worker function can be called directly (e.g., from an HTTP handler) without the policy side-effects.
-- Policy decorators work on any callable, not just Kafka workers.
-- Decorator order is irrelevant — `_attach()` walks the `__wrapped__` chain and also calls `update_registered_worker_policy()` to retroactively update an already-registered `WorkerSpec`.
+Decorator order is irrelevant — `_attach()` walks the `__wrapped__` chain and also calls `update_registered_worker_policy()` to retroactively update an already-registered `WorkerSpec`.
 
-### `@retry_to_dlq`
+#### `@retry_to_dlq`
 
 ```python
 @retry_to_dlq(
@@ -371,7 +466,7 @@ The ETL runtime reads these attributes from `WorkerSpec` (which mirrors them fro
 
 **No `@retry_to_dlq` decorator (legacy path):** The message is sent synchronously to `Config.ERROR_TOPIC`, and the offset is committed.
 
-### `@rate_limit`
+#### `@rate_limit`
 
 ```python
 @rate_limit(
@@ -380,9 +475,9 @@ The ETL runtime reads these attributes from `WorkerSpec` (which mirrors them fro
 )
 ```
 
-`RetryToDlqConfig` fields: `rps: float = 10.0`, `burst: int = 10`.
+`RateLimitConfig` fields: `rps: float = 10.0`, `burst: int = 10`.
 
-### `@circuit_breaker`
+#### `@circuit_breaker`
 
 ```python
 @circuit_breaker(
@@ -393,15 +488,105 @@ The ETL runtime reads these attributes from `WorkerSpec` (which mirrors them fro
 
 `CircuitBreakerConfig` fields: `failures: int = 5`, `reset_sec: int = 30`.
 
-### `read_policy_metadata(fn)`
+#### `read_policy_metadata(fn)`
 
 A utility for non-Kafka runtimes to introspect policy config from any decorated callable:
 
 ```python
-from framework.decorators.policies import read_policy_metadata
+from framework.decorators.intern import read_policy_metadata
 
 meta = read_policy_metadata(my_fn)
 # meta = {"retry_to_dlq": RetryToDlqConfig(...), "rate_limit": RateLimitConfig(...)}
+```
+
+---
+
+### 5b. Function-level call policies (`common.py`)
+
+**Module:** `src/framework/decorators/common.py`
+
+These decorators **wrap the function call** — they are framework-agnostic and work anywhere. Use them inside worker functions when calling external services (databases, HTTP APIs, third-party SDKs).
+
+**Gevent compatibility:** all three backing libraries use standard `threading` primitives. After `gevent.monkey.patch_all()` (which must run before any framework import), they are fully greenlet-safe.
+
+```python
+from framework.decorators import call_retry, call_circuit_breaker, call_rate_limit
+```
+
+#### `@call_retry` — backed by [tenacity](https://github.com/jd/tenacity)
+
+```python
+@call_retry(
+    max_attempts=3,         # total attempts (1 = no retry)
+    wait_fixed=1.0,         # seconds between attempts (fixed)
+    wait_exponential=False, # use exponential back-off instead
+    wait_multiplier=1.0,    # multiplier for exponential back-off
+    wait_max=60.0,          # cap for exponential back-off
+    exceptions=(Exception,),# only retry on these exception types
+    reraise=False,          # re-raise last exception instead of RetryExhaustedError
+)
+def call_external_api(payload):
+    return requests.post(url, json=payload).json()
+```
+
+Raises `RetryExhaustedError` when all attempts fail (unless `reraise=True`).
+
+#### `@call_circuit_breaker` — backed by [pybreaker](https://github.com/danielfm/pybreaker)
+
+```python
+@call_circuit_breaker(
+    fail_max=5,          # consecutive failures before opening
+    reset_timeout=30,    # seconds in open state before half-open
+    name="my-breaker",   # optional name for monitoring
+    exclude=(ValueError,),  # exception types that don't count as failures
+)
+def call_db(query):
+    return db.execute(query)
+```
+
+Raises `CircuitOpenError` while the circuit is open. The underlying `pybreaker.CircuitBreaker` instance is accessible via `fn.__circuit_breaker__` for monitoring.
+
+#### `@call_rate_limit` — backed by [limits](https://limits.readthedocs.io/)
+
+```python
+@call_rate_limit(
+    per_second=100,          # OR per_minute=... OR per_hour=...
+    storage_url="memory://", # or "redis://localhost:6379"
+    on_exceeded="raise",     # "raise" | "sleep"
+    key="my-bucket",         # optional; defaults to function qualified name
+                             # may also be a callable: key=lambda user: f"rl:{user}"
+)
+def call_api(user_id, payload):
+    return requests.post(url, json=payload).json()
+```
+
+Raises `RateLimitExceededError` when the limit is exceeded (or sleeps if `on_exceeded="sleep"`). Uses a moving-window algorithm. Supports Redis storage for multi-process rate limiting.
+
+#### Custom exceptions
+
+```python
+from framework.decorators import RetryExhaustedError, CircuitOpenError, RateLimitExceededError
+```
+
+All three exceptions inherit directly from `Exception`.
+
+#### Usage inside a Kafka worker
+
+```python
+from framework.decorators import kafka_handler, retry_to_dlq, call_retry, call_circuit_breaker
+
+@kafka_handler(name="enrich", topics_in=["events.raw"], topics_out=["events.enriched"])
+@retry_to_dlq(max_attempts=3, dlq_topic="events.dlq")  # Kafka-level retry
+def enrich_worker(message: dict, consumer_name: str, metadatas: dict) -> dict:
+    # call_retry handles transient network errors; call_circuit_breaker prevents
+    # cascading failures if the enrichment service is down.
+    result = _call_enrichment_service(message)
+    return {**message, "enrichment": result}
+
+@call_retry(max_attempts=3, wait_exponential=True, wait_max=5.0)
+@call_circuit_breaker(fail_max=5, reset_timeout=60)
+def _call_enrichment_service(message: dict) -> dict:
+    return requests.post("http://enrich-svc/enrich", json=message, timeout=2).json()
 ```
 
 ---
