@@ -1,0 +1,52 @@
+{
+  "namespaces": [
+    {
+      "name": "workers",
+      "description": "Workers exposed via HTTP"
+    }
+  ],
+  "models": {
+    "Empty": {}
+  },
+  "endpoints": [
+    {
+      "namespace": "workers",
+      "operation_name": "ner",
+      "model_name": "Empty",
+      "request_method": [
+        "POST"
+      ],
+      "api_url": "/workers/ner",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_ner"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "translate",
+      "model_name": "Empty",
+      "request_method": [
+        "POST"
+      ],
+      "api_url": "/workers/translate",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_translate"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "sentiment",
+      "model_name": "Empty",
+      "request_method": [
+        "POST"
+      ],
+      "api_url": "/workers/sentiment",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_sentiment"
+      }
+    }
+  ]
+}
