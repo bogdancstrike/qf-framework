@@ -79,3 +79,19 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: qf-jaeger
+    networks: [qfnet]
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC receiver (set QSINT_OTLP_ENDPOINT=http://localhost:4317)
+      - "4318:4318"     # OTLP HTTP receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

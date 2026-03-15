@@ -13,9 +13,7 @@
       "namespace": "workers",
       "operation_name": "ner",
       "model_name": "Empty",
-      "request_method": [
-        "POST"
-      ],
+      "request_method": ["POST"],
       "api_url": "/workers/ner",
       "exec_method": {
         "module_name": "api_endpoints",
@@ -26,9 +24,7 @@
       "namespace": "workers",
       "operation_name": "translate",
       "model_name": "Empty",
-      "request_method": [
-        "POST"
-      ],
+      "request_method": ["POST"],
       "api_url": "/workers/translate",
       "exec_method": {
         "module_name": "api_endpoints",
@@ -39,13 +35,66 @@
       "namespace": "workers",
       "operation_name": "sentiment",
       "model_name": "Empty",
-      "request_method": [
-        "POST"
-      ],
+      "request_method": ["POST"],
       "api_url": "/workers/sentiment",
       "exec_method": {
         "module_name": "api_endpoints",
         "method_name": "worker_sentiment"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "health",
+      "model_name": "Empty",
+      "request_method": ["GET"],
+      "api_url": "/workers/health",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_health"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "stats",
+      "model_name": "Empty",
+      "request_method": ["GET"],
+      "api_url": "/workers/stats",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_stats"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "echo",
+      "model_name": "Empty",
+      "request_method": ["POST"],
+      "api_url": "/workers/echo",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_echo"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "publish",
+      "model_name": "Empty",
+      "request_method": ["POST"],
+      "api_url": "/workers/publish",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_publish"
+      }
+    },
+    {
+      "namespace": "workers",
+      "operation_name": "consume",
+      "model_name": "Empty",
+      "request_method": ["GET"],
+      "api_url": "/workers/consume",
+      "exec_method": {
+        "module_name": "api_endpoints",
+        "method_name": "worker_consume"
       }
     }
   ]

@@ -1,5 +1,7 @@
 # QF Framework — Kafka Workers & Dynamic HTTP API
 
+> **Version:** v6.6 · Python 3.12 · kafka-python · Flask-RESTX · Redis · OpenTelemetry · tenacity · pybreaker · limits
+
 A Python framework for building high-throughput Kafka ETL workers and dynamic HTTP APIs from a single application, using decorator-based worker declaration and per-worker thread pools.
 
 ---
@@ -53,7 +55,7 @@ flowchart TB
 ## Quick Start
 
 ```bash
-# Start infrastructure
+# Start infrastructure (Kafka, Redis, Jaeger, Kafka-UI, Postgres)
 cd poc_app && docker compose up -d
 
 # Install dependencies
@@ -64,8 +66,11 @@ pip install -r requirements.txt
 # Configure
 cp poc_app/.env.example poc_app/.env
 
-# Run the POC app
-cd poc_app && python app.py
+# Run the PoC app
+cd poc_app && python main.py
+
+# With distributed tracing (spans visible at http://localhost:16686)
+ENABLE_TRACING=true QSINT_OTLP_ENDPOINT=http://localhost:4317 python main.py
 ```
 
 ---
@@ -174,11 +179,14 @@ handles.app.run(host="0.0.0.0", port=5000)
 | `KAFKA_MAX_JOBS_PER_TP_PER_TICK` | `500` | Max jobs dispatched per TP per tick |
 | `KAFKA_PENDING_MAX_PER_TP` | `750` | Backpressure threshold per TP |
 | `KAFKA_CONNECT_RETRIES` | `10` | Connection retry attempts |
-| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` | — | Redis for aggregation |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` | — | Redis for aggregation + API caching |
 | `REDIS_MAX_CONNECTIONS` | `50` | Connection pool size — set ≥ highest `max_workers` |
 | `REDIS_SOCKET_TIMEOUT` | `5.0` | Command timeout (seconds); raises `TimeoutError` instead of blocking |
 | `REDIS_CONNECT_TIMEOUT` | `5.0` | Connect timeout (seconds) |
 | `REDIS_RETRY_ON_TIMEOUT` | `true` | Retry once on timeout |
+| `ENABLE_TRACING` | `false` | Set `true` to activate OTel span export |
+| `QSINT_OTLP_ENDPOINT` | — | OTLP gRPC endpoint, e.g. `http://localhost:4317` |
+| `LOG_ENDPOINTS` | `false` | Set `true` to log every HTTP request/response |
 
 ---
 
@@ -231,17 +239,29 @@ Custom exceptions: `RetryExhaustedError`, `CircuitOpenError`, `RateLimitExceeded
 ## Testing
 
 ```bash
-# Unit tests (no external dependencies)
-python -m pytest tests/test_unit.py -v
+# Unit tests only (no external dependencies)
+python -m pytest tests/ -v -m unit
 
-# Integration tests (requires Kafka + Redis)
-cd poc_app && docker compose up -d
+# All unit tests (framework + PoC service layer)
+python -m pytest tests/ -v                    # 101 tests
+
+# Integration tests (requires Kafka + Redis — docker compose up -d)
 python -m pytest tests/test_integration.py -v --timeout=120
 
 # Performance tests
-python poc_app/tests/perf_http.py
-python poc_app/tests/perf_kafka.py
+python poc_app/tests/perf_http.py   [N]   # HTTP, default N=1000
+python poc_app/tests/perf_kafka.py  [N]   # Kafka E2E, default N=1000
 ```
+
+Test files and what they cover:
+
+| File | Marks | What it tests |
+|---|---|---|
+| `tests/test_unit.py` | `unit` | Worker registry, decorators, policies, Redis utils, dynamic API |
+| `tests/test_tracing.py` | `unit` | `NoOpSpan`, `NoOpTracer`, `get_tracer()`, `init_tracing()` |
+| `tests/test_api_handler.py` | `unit` | `cached_enrich`, `get_stats`, `health_check` (Redis mocked) |
+| `tests/test_kafka_service.py` | `unit` | `publish`, `consume_last` (KafkaClient mocked) |
+| `tests/test_integration.py` | `integration` | Full ETL pipeline with live Kafka + Redis |
 
 ---
 
@@ -254,11 +274,15 @@ python poc_app/tests/perf_kafka.py
 | `src/framework/decorators/common.py` | Function-level call policies: `@call_retry`, `@call_circuit_breaker`, `@call_rate_limit` |
 | `src/framework/etl/framework_etl.py` | Kafka runtime: poll loop, CommitCoordinator, dispatch |
 | `src/framework/api/dynamic.py` | Flask-RESTX dynamic endpoint generation |
-| `src/framework/redis/redis_utils.py` | Redis aggregation with Lua scripts |
-| `src/framework/app.py` | `FrameworkApp` high-level entrypoint |
-| `poc_app/src/workers/workers.py` | Example workers (POC) |
+| `src/framework/redis/redis_utils.py` | Redis connection pool, Lua scripts, aggregation |
+| `src/framework/tracing/tracing.py` | OTel tracing: `NoOpTracer`, `init_tracing`, `get_tracer`, auto-instrumentation |
+| `src/framework/app/runner.py` | `FrameworkApp` high-level entrypoint |
+| `poc_app/src/service/api_handler.py` | Redis caching, OTel spans, stats for HTTP handlers |
+| `poc_app/src/service/kafka_service.py` | One-off Kafka produce/consume for HTTP handlers |
+| `poc_app/src/workers/workers.py` | Example workers (PoC) |
 | `poc_app/src/api_endpoints.py` | HTTP endpoint handler functions |
-| `poc_app/maps/endpoint.json` | HTTP endpoint definitions |
+| `poc_app/maps/endpoint.json` | HTTP endpoint definitions (8 endpoints) |
+| `poc_app/docker-compose.yml` | Kafka, Redis, Jaeger, Kafka-UI, Postgres |
 
 ---
 

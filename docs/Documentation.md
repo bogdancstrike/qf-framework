@@ -1,8 +1,8 @@
 # QF Framework — Technical Documentation
 
-> **Version:** v6
+> **Version:** v6.6
 > **Language:** Python 3.12
-> **Core dependencies:** kafka-python, Flask-RESTX, Redis, OpenTelemetry
+> **Core dependencies:** kafka-python, Flask-RESTX, Redis, OpenTelemetry, tenacity, pybreaker, limits
 
 ---
 
@@ -15,9 +15,11 @@
 5. [Policy Decorators](#5-policy-decorators) — Kafka-runtime (`intern.py`) and function-level call policies (`common.py`)
 6. [Aggregator](#6-aggregator)
 7. [Dynamic API](#7-dynamic-api)
-8. [Configuration Reference](#8-configuration-reference)
-9. [Extension Patterns](#9-extension-patterns)
-10. [Known Limitations](#10-known-limitations)
+8. [Tracing](#8-tracing)
+9. [PoC Service Layer](#9-poc-service-layer)
+10. [Configuration Reference](#10-configuration-reference)
+11. [Extension Patterns](#11-extension-patterns)
+12. [Known Limitations](#12-known-limitations)
 
 ---
 
@@ -754,7 +756,159 @@ def worker_ner(app, operation: str, request, **kwargs):
 
 ---
 
-## 8. Configuration Reference
+## 8. Tracing
+
+**Module:** `src/framework/tracing/tracing.py`
+
+### Toggle: `ENABLE_TRACING`
+
+| Value | Behaviour |
+|---|---|
+| `false` (default) | `NoOpTracer` is active — zero I/O, zero allocations. No OTel SDK objects created. |
+| `true` | Real `TracerProvider` created; spans exported via OTLP gRPC to `QSINT_OTLP_ENDPOINT`. |
+
+```bash
+# Start Jaeger via docker-compose
+docker compose up -d jaeger
+
+# Run the app with tracing enabled
+ENABLE_TRACING=true QSINT_OTLP_ENDPOINT=http://localhost:4317 python main.py
+
+# View traces in the Jaeger UI
+open http://localhost:16686
+```
+
+### `NoOpTracer` / `NoOpSpan`
+
+When `ENABLE_TRACING=false`, `get_tracer()` returns a `NoOpTracer`. Both classes implement the full OTel interface so application code never needs to guard against a `None` tracer:
+
+```python
+tracer = get_tracer()
+with tracer.start_as_current_span("my-operation") as span:
+    span.set_attribute("key", "value")   # safe whether tracing is on or off
+    span.record_exception(exc)           # safe
+```
+
+`NoOpSpan.is_recording()` always returns `False`. Exceptions are never suppressed by context manager exit.
+
+### `init_tracing()` and auto-instrumentation
+
+`init_tracing(service_name, otlp_endpoint, insecure=True)` should be called once at startup (done automatically by `FrameworkApp`). When tracing is enabled it:
+
+1. Creates a `TracerProvider` with the service name (appears in Jaeger as the service label).
+2. Attaches a `BatchSpanProcessor` pointing at `otlp_endpoint` if provided.
+3. Calls `_instrument_libraries()` to activate auto-instrumentation for all supported libraries.
+
+### Auto-instrumentation
+
+When `ENABLE_TRACING=true`, the following libraries are automatically instrumented — every call creates a child span under the current active span:
+
+| Library | Instrumentor | Span examples |
+|---|---|---|
+| Flask | `FlaskInstrumentor` | `GET /workers/health`, `POST /workers/ner` |
+| requests | `RequestsInstrumentor` | `POST http://external-api/...` |
+| kafka-python | `KafkaInstrumentor` | `kafka.produce`, `kafka.consume` |
+| redis-py | `RedisInstrumentor` | `GET`, `SET`, `INCRBY`, `SCAN` |
+| SQLAlchemy | `SQLAlchemyInstrumentor` | `SELECT ...`, `INSERT ...` |
+
+All instrumentors are loaded with `try/except` — missing packages are silently skipped.
+
+### Trace hierarchy example
+
+A `POST /workers/ner` request with `ENABLE_TRACING=true` produces:
+
+```
+POST /workers/ner                          ← Flask auto-instrumentation
+  └─ api.ner                               ← manual span in cached_enrich()
+       ├─ INCRBY poc:stats:ner             ← Redis auto-instrumentation (stats counter)
+       ├─ GET poc:cache:<key>              ← Redis auto-instrumentation (cache lookup)
+       └─ SET poc:cache:<key>              ← Redis auto-instrumentation (cache write)
+```
+
+On a cache hit, only `INCRBY` and `GET` appear (no `SET`).
+
+### `get_tracer()` — safe anywhere
+
+`get_tracer()` lazily initialises the tracer based on `ENABLE_TRACING` if `init_tracing()` was not called first. This makes it safe to call from module-level code or tests without startup ceremony.
+
+---
+
+## 9. PoC Service Layer
+
+**Location:** `poc_app/src/service/`
+
+The service layer sits between the HTTP boundary (`api_endpoints.py`) and the business logic (`workers/workers.py`). Keeping cross-cutting concerns here means endpoint functions stay thin and the caching/tracing/stats logic is testable in isolation.
+
+### `api_handler.py` — Redis caching + stats
+
+**`cached_enrich(worker_fn, payload, endpoint_name, ...)`** is the main entry point for all worker-backed endpoints:
+
+```
+HTTP → api_endpoints.worker_X()
+     → cached_enrich(worker_fn, payload, endpoint_name)
+         ├── INCR poc:stats:<endpoint>           (atomic stats counter)
+         ├── start OTel span "api.<endpoint>"
+         ├── GET poc:cache:<sha256[:16]>          (cache lookup)
+         │     └── CACHE HIT → deserialise + return immediately
+         ├── call worker_fn(payload, ...)
+         ├── SET poc:cache:<key> EX 60            (store result, 60s TTL)
+         └── return result
+```
+
+Redis key conventions:
+
+| Pattern | Description |
+|---|---|
+| `poc:cache:<16-hex>` | Cached result for `(endpoint_name, payload)` pair |
+| `poc:stats:<endpoint>` | Integer call counter (incremented even on cache hits) |
+
+All Redis errors (connection failures, timeouts) are non-fatal: `cached_enrich` logs a warning and falls through. `health_check()` and `get_stats()` are also provided for monitoring endpoints.
+
+### `kafka_service.py` — one-off produce/consume
+
+Used by HTTP endpoints that need to interact with Kafka without the ETL consumer loop:
+
+```python
+# Produce a message to poc.echo topic
+ok = publish("poc.echo", {"id": "1", "text": "hello"})
+
+# Read the most recent message from poc.echo topic
+msg = consume_last("poc.echo")
+```
+
+Both functions open an OTel child span (`kafka.publish` / `kafka.consume`) and return `False`/`None` on error — they never raise. The `KafkaClient` singleton is created lazily on first call.
+
+### PoC HTTP endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/workers/ner` | POST | `echo_single` worker, Redis cached, OTel traced |
+| `/workers/translate` | POST | `rl_single` worker, Redis cached, list-aware |
+| `/workers/sentiment` | POST | `agg_basic_after_merge` worker, Redis cached |
+| `/workers/health` | GET | Redis liveness probe (k8s-compatible) |
+| `/workers/stats` | GET | Per-endpoint call counters from Redis |
+| `/workers/echo` | POST | Return payload unchanged (no worker, no cache) |
+| `/workers/publish` | POST | Produce payload to `poc.echo` Kafka topic |
+| `/workers/consume` | GET | Read last message from `poc.echo` Kafka topic |
+
+### Extending: adding a cached endpoint
+
+```python
+# 1. In api_endpoints.py
+from service.api_handler import cached_enrich
+from workers.workers import my_new_worker
+
+def worker_invoice(app, operation, request, **kwargs):
+    payload = request.get_json(force=True)
+    return jsonify(cached_enrich(my_new_worker, payload, endpoint_name="invoice"))
+
+# 2. In maps/endpoint.json — add an entry with method_name="worker_invoice"
+# 3. Restart. The endpoint appears in Swagger UI; cache + stats + tracing are automatic.
+```
+
+---
+
+## 10. Configuration Reference
 
 Configuration is read from environment variables by `config.Config` in the application. All keys have defaults suitable for local development.
 
@@ -824,6 +978,14 @@ Configuration is read from environment variables by `config.Config` in the appli
 |---|---|---|
 | `API_HOST` | `"0.0.0.0"` | Flask listen address (via `FrameworkSettings.api_host`). |
 | `API_PORT` | `5000` | Flask listen port. |
+| `LOG_ENDPOINTS` | `false` | Set `true` to log every HTTP request/response at DEBUG level. |
+
+### Tracing
+
+| Key | Default | Description |
+|---|---|---|
+| `ENABLE_TRACING` | `false` | Set `true` to activate OTel span export. When `false` a `NoOpTracer` is used (zero overhead). |
+| `QSINT_OTLP_ENDPOINT` | — | OTLP gRPC endpoint, e.g. `http://localhost:4317` (Jaeger). Required when `ENABLE_TRACING=true`. |
 
 ### Configuration profiles (copy-paste presets)
 
@@ -867,7 +1029,7 @@ KAFKA_MAX_JOBS_PER_TP_PER_TICK=100
 
 ---
 
-## 9. Extension Patterns
+## 11. Extension Patterns
 
 ### Adding a new Kafka worker
 
@@ -962,7 +1124,7 @@ def sensitive_worker(message: dict, consumer_name: str, metadatas: dict) -> dict
 
 ---
 
-## 10. Known Limitations
+## 12. Known Limitations
 
 ### One worker per topic (by design)
 

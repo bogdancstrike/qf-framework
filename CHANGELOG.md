@@ -4,6 +4,138 @@ All notable changes to the QF Framework and PoC application.
 
 ---
 
+## [v6.6.0] — 2026-03-15
+
+### Full PoC expansion — API service layer, Redis caching, Kafka HTTP demo, Jaeger tracing
+
+#### Core framework changes
+
+**`src/framework/tracing/tracing.py`** (rewritten)
+
+- Added `NoOpSpan` — silent stand-in implementing the full OTel Span interface (set_attribute, record_exception, set_status, add_event, is_recording, end, context-manager).
+- Added `NoOpTracer` — implements `start_as_current_span()` (contextmanager) and `start_span()`, yields `NoOpSpan`, zero I/O.
+- `init_tracing()` now returns immediately with a `NoOpTracer` when `ENABLE_TRACING=false` (default) — no OTel SDK objects are created.
+- `get_tracer()` lazily initialises based on `ENABLE_TRACING` env var; safe to call before `init_tracing()`.
+- `_tracing_enabled()` helper reads `ENABLE_TRACING` env var (accepts `1/true/yes/y/on`).
+
+**`src/framework/tracing/__init__.py`** — now exports `NoOpTracer` and `NoOpSpan`.
+
+**`src/framework/auth/`** — deleted entirely (keys.py, token.py, utils.py, __init__.py). Security is now the responsibility of the deployment environment (API gateway, mTLS). No remaining imports in framework or PoC.
+
+**`src/framework/api/server.py`**
+
+- Removed `TOKEN_URL` and `JWT_ALGORITHM` auth config references.
+- Request/response logging middleware now controlled by `LOG_ENDPOINTS=true` env var (off by default).
+
+#### PoC service layer (new)
+
+**`poc_app/src/service/__init__.py`** — package marker.
+
+**`poc_app/src/service/api_handler.py`** (new)
+
+Service layer between HTTP boundary (`api_endpoints.py`) and workers:
+
+- `cached_enrich(worker_fn, payload, endpoint_name, ...)` — main entry point:
+  - Increments `poc:stats:<endpoint>` Redis counter atomically (INCR).
+  - Opens OTel span `api.<endpoint_name>` with attributes.
+  - Checks `poc:cache:<sha256[:16]>` for a cached result (60s TTL).
+  - On miss: calls worker_fn, stores result in Redis.
+  - All Redis errors are non-fatal; logs warnings and falls through.
+- `get_stats()` — scans `poc:stats:*` keys, returns `{endpoint: count}` dict.
+- `health_check()` — PINGs Redis, returns `{"status": "ok|degraded", "redis": "..."}`.
+- Redis key conventions: `poc:cache:<16-hex>`, `poc:stats:<endpoint>`.
+
+**`poc_app/src/service/kafka_service.py`** (new)
+
+One-off Kafka produce/consume for HTTP handlers:
+
+- `publish(topic, message, key=None) -> bool` — JSON-encodes and produces, returns False on error (never raises).
+- `consume_last(topic, group_id) -> Optional[dict]` — reads the most recent message from a topic, returns None if empty or on error.
+- Both functions open OTel child spans (`kafka.publish`, `kafka.consume`) for Jaeger trace correlation.
+- Lazy singleton `_get_kafka()` using `KafkaClient.get_instance(security_protocol='NONE')`.
+
+#### PoC API endpoints (updated)
+
+**`poc_app/src/api_endpoints.py`** — updated with inline routing lifecycle comments; all workers now go through `cached_enrich`:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/workers/ner` | POST | echo_single worker, Redis cached |
+| `/workers/translate` | POST | rl_single worker, Redis cached, list-aware |
+| `/workers/sentiment` | POST | agg_basic_after_merge worker, Redis cached |
+| `/workers/health` | GET | Redis liveness probe |
+| `/workers/stats` | GET | Per-endpoint call counters from Redis |
+| `/workers/echo` | POST | Return payload unchanged (no cache) |
+| `/workers/publish` | POST | Produce payload to `poc.echo` Kafka topic |
+| `/workers/consume` | GET | Read last message from `poc.echo` Kafka topic |
+
+**`poc_app/maps/endpoint.json`** — added `health`, `stats`, `echo`, `publish`, `consume` entries.
+
+#### Infrastructure
+
+**`poc_app/docker-compose.yml`** — added Jaeger service:
+
+```yaml
+jaeger:
+  image: jaegertracing/all-in-one:latest
+  ports:
+    - "16686:16686"   # UI
+    - "4317:4317"     # OTLP gRPC
+    - "4318:4318"     # OTLP HTTP
+  environment:
+    COLLECTOR_OTLP_ENABLED: "true"
+```
+
+**`poc_app/.env.example`** — added `ENABLE_TRACING=false`, `QSINT_OTLP_ENDPOINT`, `LOG_ENDPOINTS=false`.
+
+**`poc_app/main.py`** — improved startup log line shows tracing/kafka/port; added detailed docstring with tracing quick-start instructions.
+
+#### Tests (new)
+
+**`pytest.ini`** — registered `unit` and `integration` pytest markers.
+
+**`tests/test_tracing.py`** (new, 18 tests `@pytest.mark.unit`):
+- `TestNoOpSpan` — all OTel Span methods accepted silently; context manager propagates exceptions.
+- `TestNoOpTracer` — yields NoOpSpan; nested spans; exception propagation.
+- `TestGetTracer` — returns NoOpTracer when disabled; singleton behaviour; init_tracing noop path.
+
+**`tests/test_api_handler.py`** (new, 13 tests `@pytest.mark.unit`):
+- `TestCachedEnrich` — cache hit/miss, worker called/skipped, stats increment, exception propagation, non-fatal Redis errors, cache key collision avoidance.
+- `TestGetStats` — populated/empty/error Redis states.
+- `TestHealthCheck` — ok and degraded paths.
+
+**`tests/test_kafka_service.py`** (new, 9 tests `@pytest.mark.unit`):
+- `TestPublish` — success, JSON encoding, key forwarding, error→False, no-raise guarantee.
+- `TestConsumeLast` — parsed dict, empty topic→None, error→None, group_id forwarding.
+
+**Total: 40 new tests (101 passing overall).**
+
+#### OTel auto-instrumentation (new)
+
+**`src/framework/tracing/tracing.py`** — `_instrument_libraries()` called automatically by `init_tracing()` when `ENABLE_TRACING=true`:
+
+| Library | Instrumentor | Spans created |
+|---|---|---|
+| Flask | `FlaskInstrumentor` | Every HTTP request (server-side) |
+| requests | `RequestsInstrumentor` | Every outbound HTTP call |
+| kafka-python | `KafkaInstrumentor` | Every produce / consume |
+| redis-py | `RedisInstrumentor` | Every Redis command (GET, SET, INCRBY, …) |
+| SQLAlchemy | `SQLAlchemyInstrumentor` | Every SQL query |
+
+All instrumentors are wrapped in `try/except` so missing packages are silently skipped. This means the framework works in minimal environments (e.g. Kafka-only with no Redis) without crashing.
+
+**`requirements.txt`** — added `opentelemetry-instrumentation-redis==0.51b0`.
+
+#### Verified end-to-end
+
+- `docker compose up -d` starts Kafka, Redis, Kafka-UI, Postgres, Jaeger.
+- `ENABLE_TRACING=true QSINT_OTLP_ENDPOINT=http://localhost:4317 python main.py` starts app.
+- Spans `api.ner`, `api.translate`, `api.stats` verified in Jaeger UI at `http://localhost:16686`.
+- All 8 endpoints respond correctly; `poc:stats:*` counters increment per call; cache hits skip worker.
+- Redis auto-instrumentation verified: `GET`, `INCRBY`, `SET`, `SCRIPT LOAD` spans appear as children of `api.*` spans in Jaeger.
+
+---
+
 ## [v6.5.0] — 2026-03-15
 
 ### `common.py` decorators applied in POC workers + perf test improvements
