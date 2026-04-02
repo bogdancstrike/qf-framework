@@ -15,7 +15,7 @@ class KafkaClient(StreamClientInterface):
     # @classmethod
     def __init__(
             self,
-            security_protocol: Optional[str] = 'SSL',  # SASL_SSL
+            security_protocol: Optional[str] = None,
             sasl_mechanism='PLAIN',  # 'PLAIN, GSSAPI
             ssl_check_hostname: Optional[bool] = False,
             ssl_cafile: Optional[str] = None,
