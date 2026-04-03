@@ -205,9 +205,14 @@ def _commit_offsets(consumer: KafkaConsumer, offsets: Dict[TopicPartition, int])
         return
     try:
         with consumer_lock:
+            if not consumer.assignment():
+                logger.debug("🟡 [COMMIT SKIP] no assigned partitions", "yellow")
+                return
             consumer.commit(offsets={tp: OffsetAndMetadata(off, None) for tp, off in offsets.items()})
+    except KafkaError as e:
+        logger.debug(f"🟡 [COMMIT SKIP] rebalance: {e}", "yellow")
     except Exception as e:
-        logger.debug(f"🟡 [COMMIT FAIL] err={e}", "yellow")
+        logger.warning(f"🔴 [COMMIT FAIL] unexpected: {e}")
 
 
 # ==========================================================
