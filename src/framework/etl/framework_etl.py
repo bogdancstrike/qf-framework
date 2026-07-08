@@ -21,6 +21,21 @@ try:
 except Exception:  # pragma: no cover
     OffsetAndMetadata = None  # type: ignore
 
+
+def _offset_and_metadata(offset: int):
+    """Build an ``OffsetAndMetadata`` across kafka-python versions.
+
+    kafka-python 2.3+ added a required ``leader_epoch`` field; older releases
+    only had ``(offset, metadata)``. Construct positionally by the class's own
+    field count, using ``-1`` (unknown) for ``leader_epoch`` — kafka-python's own
+    sentinel. We use the imported class as-is (never a replacement namedtuple),
+    so it stays identical to the one ``kafka.coordinator`` holds and its
+    ``isinstance(v, OffsetAndMetadata)`` commit assertions keep passing.
+    """
+    if len(OffsetAndMetadata._fields) >= 3:
+        return OffsetAndMetadata(offset, None, -1)
+    return OffsetAndMetadata(offset, None)
+
 from config import Config
 from framework.commons.logger import logger
 from framework.commons.utils import deep_merge
@@ -205,7 +220,7 @@ def _commit_offsets(consumer: KafkaConsumer, offsets: Dict[TopicPartition, int])
         return
     try:
         with consumer_lock:
-            consumer.commit(offsets={tp: OffsetAndMetadata(off, None) for tp, off in offsets.items()})
+            consumer.commit(offsets={tp: _offset_and_metadata(off) for tp, off in offsets.items()})
     except Exception as e:
         logger.debug(f"🟡 [COMMIT FAIL] err={e}", "yellow")
 

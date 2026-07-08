@@ -1,6 +1,6 @@
 [project]
 name = "qf"
-version = "1.0.3"
+version = "1.0.4"
 authors = []
 description = "Utilities for developing QSINT python applications"
 readme = "README.md"
