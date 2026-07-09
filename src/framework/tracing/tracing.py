@@ -249,3 +249,66 @@ def get_tracer():
         else:
             tracer = NoOpTracer()
     return tracer
+
+
+# ---------------------------------------------------------------------------
+# Kafka trace propagation (W3C traceparent over message headers)
+# ---------------------------------------------------------------------------
+#
+# OpenTelemetry's KafkaInstrumentor only wraps the consumer's ``__next__`` /
+# iterator path; the framework's ETL uses ``consumer.poll()`` and dispatches
+# handlers on a ThreadPoolExecutor, so producer→consumer context is NOT linked
+# automatically. These helpers make propagation explicit: the producer injects
+# the current trace context into Kafka message *headers*, and the consumer
+# extracts it and runs the handler under that context — so a message produced in
+# one service continues the SAME distributed trace when consumed in another.
+
+def inject_trace_headers(existing=None):
+    """Return Kafka message headers (list of ``(str, bytes)``) carrying the
+    current W3C trace context.
+
+    ``existing`` may be a list of header tuples or a dict; its entries are
+    preserved. Safe when tracing is disabled — no ``traceparent`` is added and
+    the existing headers are returned unchanged.
+    """
+    headers: list = []
+    if isinstance(existing, dict):
+        headers.extend((k, v) for k, v in existing.items())
+    elif existing:
+        headers.extend(existing)
+    try:
+        from opentelemetry.propagate import inject
+
+        carrier: dict = {}
+        inject(carrier)
+        for k, v in carrier.items():
+            headers.append((k, v.encode("utf-8") if isinstance(v, str) else v))
+    except Exception:  # pragma: no cover - tracing optional
+        pass
+    return headers
+
+
+def extract_context_from_headers(headers):
+    """Extract an OTel ``Context`` from Kafka message headers.
+
+    ``headers`` is the kafka-python record ``headers`` (a list of
+    ``(str, bytes)``) or a dict. Returns ``None`` when there is nothing to
+    extract or tracing is unavailable — callers pass the result straight to
+    ``start_as_current_span(context=...)`` where ``None`` means "current context".
+    """
+    if not headers:
+        return None
+    try:
+        from opentelemetry.propagate import extract
+
+        carrier: dict = {}
+        items = headers.items() if isinstance(headers, dict) else headers
+        for k, v in items:
+            if v is None:
+                continue
+            carrier[k] = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+        if not carrier:
+            return None
+        return extract(carrier)
+    except Exception:  # pragma: no cover - tracing optional
+        return None

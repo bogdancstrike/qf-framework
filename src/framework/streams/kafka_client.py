@@ -126,8 +126,12 @@ class KafkaClient(StreamClientInterface):
     def put_message(self, topic_name: str, message: str, key: str = None):
         try:
             start_time = time.time()
+            # Ride the current W3C trace context on Kafka message headers so the
+            # consumer can continue the SAME distributed trace (see tracing helpers).
+            from ..tracing import inject_trace_headers
+            headers = inject_trace_headers() or None
             future = self.producer.send(topic_name, key=key.encode('utf-8') if key else None,
-                                        value=message.encode('utf-8'))
+                                        value=message.encode('utf-8'), headers=headers)
             future.get(timeout=10)
             end_time = time.time()
             logger.debug(

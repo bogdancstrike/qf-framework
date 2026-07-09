@@ -7,7 +7,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import sleep
 from typing import Deque, Dict, Iterable, List, Optional, Set
 
@@ -167,7 +167,10 @@ def _send_async(producer: KafkaProducer, topic: str, payload: dict, *, label: st
     IMPORTANT: this does NOT guarantee delivery; it's only queued in the producer.
     """
     mid = payload.get("id")
-    fut = producer.send(topic, payload)
+    # Propagate the current trace context onto the forwarded message's headers so
+    # the next consumer in the pipeline stays on the same distributed trace.
+    from framework.tracing import inject_trace_headers
+    fut = producer.send(topic, payload, headers=inject_trace_headers() or None)
     logger.debug(f"🟢 [OUT] {label} topic={topic} id={mid}", "green")
     return fut
 
@@ -189,7 +192,8 @@ def _send_sync(producer: KafkaProducer, topic: str, payload: dict, *, label: str
     """
     mid = payload.get("id")
     try:
-        fut = producer.send(topic, payload)
+        from framework.tracing import inject_trace_headers
+        fut = producer.send(topic, payload, headers=inject_trace_headers() or None)
         fut.get(timeout=timeout_sec)
         logger.debug(f"🟢 [OUT SYNC] {label} topic={topic} id={mid}", "green")
         return True
@@ -470,6 +474,36 @@ class CommitCoordinator:
 # Worker runners
 # ==========================================================
 
+def _consume_span(spec: WorkerSpec, tp: TopicPartition, offset, mid, headers):
+    """Start a ``kafka.consume`` span whose parent is the trace context carried on
+    the message headers, so the handler continues the producer's distributed trace.
+
+    Returns the ``start_as_current_span`` context manager (a NoOp span when tracing
+    is disabled). Runs inside the worker thread, so the extracted context is bound
+    on the thread that actually executes the handler.
+    """
+    from framework.tracing import get_tracer, extract_context_from_headers
+
+    tracer = get_tracer()
+    parent = extract_context_from_headers(headers)
+    cm = tracer.start_as_current_span(f"kafka.consume {tp.topic}", context=parent)
+
+    def _annotate(span):
+        try:
+            span.set_attribute("messaging.system", "kafka")
+            span.set_attribute("messaging.operation", "process")
+            span.set_attribute("messaging.destination", tp.topic)
+            span.set_attribute("messaging.kafka.partition", tp.partition)
+            span.set_attribute("messaging.kafka.offset", offset)
+            span.set_attribute("worker.name", spec.name)
+            if mid is not None:
+                span.set_attribute("messaging.message.id", str(mid))
+        except Exception:
+            pass
+
+    return cm, _annotate
+
+
 def _forward_result(
     producer: KafkaProducer,
     spec: WorkerSpec,
@@ -521,17 +555,21 @@ def _run_handler_single(
     *,
     output_sync: bool,
     output_sync_timeout_sec: float,
+    headers: list = None,
 ) -> bool:
     mid = message_value.get("id")
     try:
-        result = spec.fn(message_value, consumer_name, dict(spec.metadatas))
-        ok = _forward_result(
-            producer,
-            spec,
-            result,
-            wait_for_acks=output_sync,
-            ack_timeout_sec=output_sync_timeout_sec,
-        )
+        cm, _annotate = _consume_span(spec, tp, offset, mid, headers)
+        with cm as span:
+            _annotate(span)
+            result = spec.fn(message_value, consumer_name, dict(spec.metadatas))
+            ok = _forward_result(
+                producer,
+                spec,
+                result,
+                wait_for_acks=output_sync,
+                ack_timeout_sec=output_sync_timeout_sec,
+            )
         if ok and spec.circuit_breaker:
             cb_on_success(state)
         return ok
@@ -561,16 +599,26 @@ def _run_handler_bulk(
     *,
     output_sync: bool,
     output_sync_timeout_sec: float,
+    headers: list = None,
 ) -> bool:
     try:
-        result = spec.fn(batch, consumer_name, dict(spec.metadatas))
-        ok = _forward_result(
-            producer,
-            spec,
-            result,
-            wait_for_acks=output_sync,
-            ack_timeout_sec=output_sync_timeout_sec,
-        )
+        # For a batch, parent the span on the first message's trace context.
+        cm, _annotate = _consume_span(spec, tp, offsets[0] if offsets else -1,
+                                      (batch[0].get("id") if batch else None), headers)
+        with cm as span:
+            _annotate(span)
+            try:
+                span.set_attribute("messaging.batch.size", len(batch))
+            except Exception:
+                pass
+            result = spec.fn(batch, consumer_name, dict(spec.metadatas))
+            ok = _forward_result(
+                producer,
+                spec,
+                result,
+                wait_for_acks=output_sync,
+                ack_timeout_sec=output_sync_timeout_sec,
+            )
         if ok and spec.circuit_breaker:
             cb_on_success(state)
         return ok
@@ -606,8 +654,10 @@ def _run_aggregator(
     *,
     output_sync: bool,
     output_sync_timeout_sec: float,
+    headers: list = None,
 ) -> bool:
     mid = message_value.get("id")
+    _agg_cm, _agg_annotate = _consume_span(spec, tp, offset, mid, headers)
     agg_key_val = compute_aggregate_key(spec, message_value)
     agg_key = f"agg:{spec.name}:{agg_key_val}"
 
@@ -654,14 +704,16 @@ def _run_aggregator(
             return True
 
         aggregated = _aggregate_merge(msgs)
-        result = spec.fn(aggregated, consumer_name, dict(spec.metadatas))
-        ok = _forward_result(
-            producer,
-            spec,
-            result,
-            wait_for_acks=output_sync,
-            ack_timeout_sec=output_sync_timeout_sec,
-        )
+        with _agg_cm as span:
+            _agg_annotate(span)
+            result = spec.fn(aggregated, consumer_name, dict(spec.metadatas))
+            ok = _forward_result(
+                producer,
+                spec,
+                result,
+                wait_for_acks=output_sync,
+                ack_timeout_sec=output_sync_timeout_sec,
+            )
 
         if ok:
             try:
@@ -697,6 +749,7 @@ class PendingItem:
     offset: int
     raw: str
     ts: float  # enqueue time (strict batching)
+    headers: list = field(default_factory=list)  # kafka record headers (trace ctx)
 
 
 # ==========================================================
@@ -869,7 +922,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                              "magenta")
                 coordinator.init_tp(tp, item.offset)
 
-                def _job(tp_=tp, off=item.offset, msgv=val, spec_=spec, st_=st):
+                def _job(tp_=tp, off=item.offset, msgv=val, spec_=spec, st_=st, hdrs=item.headers):
                     ok = _run_aggregator(
                         spec_,
                         producer,
@@ -882,6 +935,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                         st_,
                         output_sync=False,
                         output_sync_timeout_sec=output_ack_timeout_sec,
+                        headers=hdrs,
                     )
                     if ok:
                         coordinator.mark_done(tp_, off)
@@ -913,12 +967,15 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
 
                 offsets: List[int] = []
                 payloads: List[dict] = []
+                batch_headers: list = []
                 for it in chunk:
                     try:
                         val = json.loads(it.raw)
                         ensure_message_id(val)
                         offsets.append(it.offset)
                         payloads.append(val)
+                        if not batch_headers:
+                            batch_headers = it.headers
                     except Exception as _parse_err:
                         logger.debug(f"🟡 [BULK PARSE ERR] tp={_tp(tp)} off={it.offset} err={_parse_err}", "yellow")
                         coordinator.mark_done(tp, it.offset)
@@ -933,7 +990,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                     "magenta")
                 coordinator.init_tp(tp, offsets[0])
 
-                def _job(tp_=tp, offs=offsets, payloads_=payloads, spec_=spec, st_=st):
+                def _job(tp_=tp, offs=offsets, payloads_=payloads, spec_=spec, st_=st, hdrs=batch_headers):
                     ok = _run_handler_bulk(
                         spec_,
                         producer,
@@ -944,6 +1001,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                         st_,
                         output_sync=bulk_output_sync,
                         output_sync_timeout_sec=output_ack_timeout_sec,
+                        headers=hdrs,
                     )
                     if ok:
                         for off in offs:
@@ -975,7 +1033,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                          "magenta")
             coordinator.init_tp(tp, item.offset)
 
-            def _job(tp_=tp, off=item.offset, msgv=val, spec_=spec, st_=st):
+            def _job(tp_=tp, off=item.offset, msgv=val, spec_=spec, st_=st, hdrs=item.headers):
                 ok = _run_handler_single(
                     spec_,
                     producer,
@@ -986,6 +1044,7 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                     st_,
                     output_sync=False,
                     output_sync_timeout_sec=output_ack_timeout_sec,
+                    headers=hdrs,
                 )
                 if ok:
                     coordinator.mark_done(tp_, off)
@@ -1061,7 +1120,8 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                         if len(q) >= pending_max_per_tp:
                             first_unenqueued = m.offset
                             break
-                        q.append(PendingItem(offset=m.offset, raw=_safe_decode(m.value), ts=time.time()))
+                        q.append(PendingItem(offset=m.offset, raw=_safe_decode(m.value), ts=time.time(),
+                                             headers=list(m.headers or [])))
                     if first_unenqueued is not None:
                         _pause_and_seek_backlog(tp, "pending_full", first_unenqueued)
                     continue
@@ -1075,7 +1135,8 @@ def start(*, worker_modules: Iterable[str], bootstrap_servers: str, consumer_nam
                     try:
                         val = json.loads(raw)
                         ensure_message_id(val)
-                        q.append(PendingItem(offset=m.offset, raw=json.dumps(val), ts=time.time()))
+                        q.append(PendingItem(offset=m.offset, raw=json.dumps(val), ts=time.time(),
+                                             headers=list(m.headers or [])))
                     except Exception as _parse_err:
                         coordinator.mark_done(tp, m.offset)
                         continue
